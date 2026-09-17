@@ -1,52 +1,299 @@
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-import requests
-import pandas as pd
+const express = require('express');
+const fetch = require('node-fetch');
+const path = require('path');
 
-app = FastAPI()
+const app = express();
 
-headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-    'Accept': '*/*', 
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Referer': 'https://www.nseindia.com/option-chain'
+app.use(express.static(path.join(__dirname, '../public')));
+
+// NSE requires browser-like headers — this proxy adds them server-side
+const NSE_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept': '*/*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Referer': 'https://www.nseindia.com/option-chain',
+  'Origin': 'https://www.nseindia.com',
+  'Connection': 'keep-alive',
+  'Cache-Control': 'no-cache',
+  'Pragma': 'no-cache',
+};
+
+
+// Simple in-memory cache to avoid hammering NSE (2.5s TTL)
+let cache = { data: null, ts: 0, expiry: null };
+
+const CACHE_TTL = 2500;
+const COOKIE_TTL = 10 * 60 * 1000;
+
+let cookieCache = {
+  value: '',
+  ts: 0
+};
+
+async function fetchNSECookies() {
+  const res = await fetch('https://www.nseindia.com/', { headers: NSE_HEADERS });
+  const cookies = res.headers.raw()['set-cookie'] || [];
+  return cookies.map(c => c.split(';')[0]).join('; ');
 }
 
-@app.get("/api/nifty-oi")
-def get_oi_data(symbol: str = "NIFTY"):
-    session = requests.Session()
-    try:
-        # Initialize session cookies
-        session.get("https://www.nseindia.com", headers=headers, timeout=5)
-        
-        # Get Expiries
-        c_res = session.get(f"https://www.nseindia.com/api/option-chain-contract-info?symbol={symbol}", headers=headers, timeout=5)
-        expiries = c_res.json().get("expiryDates", [])
-        
-        if not expiries:
-            return JSONResponse({"error": "No expiries found"}, status_code=500)
-            
-        # Fetch Option Chain
-        chain_res = session.get(f"https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol={symbol}&expiry={expiries[0]}", headers=headers, timeout=5)
-        data = chain_res.json()
-        
-        records = data.get('records', {}).get('data', [])
-        spot_price = data.get('records', {}).get('underlyingValue', 0.0)
-        
-        # Format data for the frontend chart
-        clean_data = []
-        for row in records:
-            if row.get("expiryDate") == expiries[0]:
-                clean_data.append({
-                    "strike": row.get("strikePrice"),
-                    "ce_oi": row.get("CE", {}).get("openInterest", 0),
-                    "pe_oi": row.get("PE", {}).get("openInterest", 0)
-                })
-                
-        return {
-            "symbol": symbol,
-            "spot_price": spot_price,
-            "data": clean_data
-        }
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+async function getCookies() {
+  const now = Date.now();
+
+  if (
+    cookieCache.value &&
+    now - cookieCache.ts < COOKIE_TTL
+  ) {
+    return cookieCache.value;
+  }
+
+  const cookies = await fetchNSECookies();
+
+  cookieCache = {
+    value: cookies,
+    ts: now
+  };
+
+  return cookies;
+}
+
+
+async function fetchOptionChain(symbol = 'NIFTY', expiryDate = null) {
+  const now = Date.now();
+
+  if (
+    cache.data &&
+    now - cache.ts < CACHE_TTL &&
+    (!expiryDate || cache.expiry === expiryDate)
+  ) {
+    return cache.data;
+  }
+
+  let cookies = '';
+
+  try {
+    cookies = await getCookies();
+  } catch (e) {
+    console.error('Cookie fetch failed:', e.message);
+  }
+
+  // Bootstrap expiry required by NSE
+  const bootstrapExpiry = expiryDate || '30-Jun-2026';
+
+  let url =
+    `https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=${symbol}&expiry=${encodeURIComponent(bootstrapExpiry)}`;
+
+  const controller1 = new AbortController();
+
+  const timeout1 = setTimeout(() => {
+    controller1.abort();
+  }, 5000);
+
+  let res = await fetch(url, {
+    headers: {
+      ...NSE_HEADERS,
+      Cookie: cookies
+    },
+    signal: controller1.signal
+  });
+
+  clearTimeout(timeout1);
+
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      cookieCache = {
+        value: '',
+        ts: 0
+      };
+    }
+    throw new Error(`NSE API returned ${res.status}: ${res.statusText}`);
+  }
+
+  let raw = await res.json();
+
+  if (!raw?.records?.expiryDates?.length) {
+    throw new Error('Unexpected NSE response structure');
+  }
+
+  const allExpiries = raw.records.expiryDates;
+
+  // Automatically use the nearest live expiry
+  const targetExpiry = expiryDate || allExpiries[0];
+
+  // If target differs from bootstrap, fetch again
+  if (targetExpiry !== bootstrapExpiry) {
+    url =
+      `https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol=${symbol}&expiry=${encodeURIComponent(targetExpiry)}`;
+
+    const controller1 = new AbortController();
+
+    const timeout1 = setTimeout(() => {
+      controller1.abort();
+    }, 5000);
+
+    let res = await fetch(url, {
+      headers: {
+        ...NSE_HEADERS,
+        Cookie: cookies
+      },
+      signal: controller1.signal
+    });
+
+    clearTimeout(timeout1);
+
+    if (!res.ok) {
+      if (res.status === 401 || res.status === 403) {
+        cookieCache = {
+          value: '',
+          ts: 0
+        };
+      }
+      throw new Error(`NSE API returned ${res.status}: ${res.statusText}`);
+    }
+
+    raw = await res.json();
+
+    if (!raw?.records?.data) {
+      throw new Error('Unexpected NSE response structure');
+    }
+  }
+
+  const spot = raw.records.underlyingValue || 0;
+
+  const atm = Math.round(spot / 50) * 50;
+  const MIN_STRIKE = atm - 500;
+  const MAX_STRIKE = atm + 500;
+
+  const rows = (raw.records.data || []).filter(r => {
+    const rowExpiry = r.expiryDate || r.expiryDates;
+
+    return (
+      rowExpiry === targetExpiry &&
+      r.strikePrice >= MIN_STRIKE &&
+      r.strikePrice <= MAX_STRIKE
+    );
+  });
+
+  const strikeMap = {};
+
+  rows.forEach(r => {
+    const strike = r.strikePrice;
+
+    if (!strikeMap[strike]) {
+      strikeMap[strike] = {
+        strike
+      };
+    }
+
+    if (r.CE) strikeMap[strike].CE = r.CE;
+    if (r.PE) strikeMap[strike].PE = r.PE;
+  });
+
+  const strikes = Object.values(strikeMap).sort(
+    (a, b) => a.strike - b.strike
+  );
+
+  let totalCallOI = 0;
+  let totalPutOI = 0;
+  let totalCallChgOI = 0;
+  let totalPutChgOI = 0;
+
+  let maxCallOI = 0;
+  let maxPutOI = 0;
+  let maxCallOIStrike = atm;
+  let maxPutOIStrike = atm;
+
+  let maxCallChgOI = -Infinity;
+  let maxPutChgOI = -Infinity;
+  let maxCallChgStrike = atm;
+  let maxPutChgStrike = atm;
+
+  strikes.forEach(s => {
+    const cOI = s.CE?.openInterest || 0;
+    const pOI = s.PE?.openInterest || 0;
+
+    const cChg = s.CE?.changeinOpenInterest || 0;
+    const pChg = s.PE?.changeinOpenInterest || 0;
+
+    totalCallOI += cOI;
+    totalPutOI += pOI;
+
+    totalCallChgOI += cChg;
+    totalPutChgOI += pChg;
+
+    if (cOI > maxCallOI) {
+      maxCallOI = cOI;
+      maxCallOIStrike = s.strike;
+    }
+
+    if (pOI > maxPutOI) {
+      maxPutOI = pOI;
+      maxPutOIStrike = s.strike;
+    }
+
+    if (cChg > maxCallChgOI) {
+      maxCallChgOI = cChg;
+      maxCallChgStrike = s.strike;
+    }
+
+    if (pChg > maxPutChgOI) {
+      maxPutChgOI = pChg;
+      maxPutChgStrike = s.strike;
+    }
+  });
+
+  const pcr =
+    totalCallOI > 0
+      ? totalPutOI / totalCallOI
+      : 0;
+
+  const result = {
+    spot,
+    atm,
+    expiry: targetExpiry,
+    allExpiries,
+    pcr: Number(pcr.toFixed(2)),
+    totalCallOI,
+    totalPutOI,
+    totalCallChgOI,
+    totalPutChgOI,
+    maxCallOIStrike,
+    maxPutOIStrike,
+    maxCallChgStrike,
+    maxPutChgStrike,
+    strikes,
+    fetchedAt: new Date().toISOString()
+  };
+
+  cache = {
+    data: result,
+    ts: now,
+    expiry: targetExpiry
+  };
+
+  return result;
+}
+
+// CORS headers for frontend
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  next();
+});
+
+app.get('/api/option-chain', async (req, res) => {
+  try {
+    const { expiry } = req.query;
+    const data = await fetchOptionChain('NIFTY', expiry || null);
+    res.json({ ok: true, data });
+  } catch (err) {
+    console.error('Error fetching option chain:', err.message);
+    res.status(502).json({ ok: false, error: err.message });
+  }
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, ts: new Date().toISOString() });
+});
+
+module.exports = app;
